@@ -1,0 +1,37 @@
+allowEmptyPassword: false
+mariadb:
+  enabled: false
+livenessProbe:
+  initialDelaySeconds: 600
+  timeoutSeconds: 10
+  periodSeconds: 20
+  successThreshold: 1 
+  failureThreshold: 10
+readinessProbe:
+  initialDelaySeconds: 300
+  timeoutSeconds: 10
+  periodSeconds: 20
+  successThreshold: 1
+  failureThreshold: 10
+image:
+  repository: ${CNAB_P_WORDPRESS_REPOSITORY_NAME}
+  tag: ${CNAB_P_WORDPRESS_TAG}
+externalDatabase:
+  host: ${externalDatabase_host}
+  user: ${externalDatabase_user}
+  password: ${externalDatabase_password}
+  database: ${externalDatabase_database}
+  port: 3306
+persistence:
+  existingClaim: ${pv_name}
+replicaCount: ${CNAB_P_WORDPRESS_RELICA_COUNT}
+ingress: 
+  enabled: true
+service:
+  type: ClusterIP
+smtpHost: null
+smtpPort: null
+smtpUser: null
+smtpPassword: null
+smtpProtocol: null
+smtpUsername: null

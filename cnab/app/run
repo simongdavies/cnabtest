@@ -1,0 +1,210 @@
+#!/bin/bash
+set -e
+
+action=$CNAB_ACTION
+name=$CNAB_INSTALLATION_NAME 
+tfdir=/cnab/app/tf/
+export app_domain="wordpress.local"
+
+# translate_vars translates all env vars prefixed by CNAB_P_ into corresponding TF_VAR_ env vars, as used by Terraform
+# e.g., CNAB_P_LOCATION becomes TF_VAR_location
+
+function translate_vars() {
+    cnab_prefix="CNAB_P_"
+
+    for cnab_var in $(compgen -v "${cnab_prefix}"); do
+        var="$(echo "${cnab_var#${cnab_prefix}}" | awk '{print tolower($0)}')"
+        echo "TF_VAR_${var}=${!cnab_var}"
+        export "TF_VAR_${var}"="${!cnab_var}"
+    done
+}
+
+function install_or_update_app() {
+    
+    export create_dns="${CNAB_P_CREATE_DNS:-false}"
+
+    # if a DNS Record is to be created then we need the RG zone and record name for Azure DNS
+
+    if [[ "${create_dns}" == "true" ]]; then
+        : "${CNAB_P_DNS_ZONE_RG:?dns_zone_rg should be set}"
+        : "${CNAB_P_DNS_ZONE_NAME:?dns_zone_name should be set}"
+        : "${CNAB_P_DNS_RECORD_NAME:?dns_record_name should be set}"
+        export dns_delete_existing_records="${CNAB_P_DNS_DELETE_EXISTING_RECORDS:-false}"
+    fi
+
+    export enable_https="${CNAB_P_ENABLE_HTTPS:-false}"
+
+    if [[ "${enable_https}" == "true" ]]; then
+        if [[ "${create_dns}" != "true" ]]; then
+            echo "Must create a DNS record to use HTTPS"
+            exit 1
+        fi
+        # TODO: Validate the email address
+        : "${CNAB_P_CERT_EMAIL_ADDRESS:?cert_email_address should be set}"
+    fi
+
+    # Create or update the resources using TF
+
+    terraform apply -auto-approve -input=false
+
+    # Get the outputs from the TF config
+
+    export resource_group_name="$(terraform output resource_group_name)"
+    export cluster_name="$(terraform output cluster_name)"
+    export file_share_name="$(terraform output file_share_name)"
+    export file_share_storage_account_name="$(terraform output file_share_storage_account_name)"
+    export file_share_storage_account_key="$(terraform output file_share_storage_account_key)"
+    export externalDatabase_host="$(terraform output externalDatabase_host)"
+    export externalDatabase_user="$(terraform output externalDatabase_user)"
+    export externalDatabase_password="$(terraform output externalDatabase_password)"
+    export externalDatabase_database="$(terraform output externalDatabase_database)"
+    export external_ip="$(terraform output public_ip_address)"
+
+    # Login with the Azure CLI and get the kubernetes config
+        
+    az login --service-principal --username "${TF_VAR_client_id}" --password "${TF_VAR_client_secret}" --tenant "${TF_VAR_tenant_id}"
+    az account set --subscription "${TF_VAR_subscription_id}"
+    az aks get-credentials --resource-group "${resource_group_name}" --name "${cluster_name}" --admin 
+    
+    # Install Contour
+    
+    # echo "Installing Contour"
+
+    # No Helm chart for Contour yet
+    # See https://github.com/helm/charts/pull/7385 
+
+    envsubst < "${BASH_SOURCE%/*}/contour/contour-deployment-rbac.yaml" | kubectl apply -f -
+    
+    # Wait for external IP address to be assigned
+    
+    # while [[ -z "${external_ip}" ]]; do
+    #     sleep 10
+    #     echo "Waiting for IP Address assignment for Load Balancer"
+    #     external_ip=$(kubectl get -n heptio-contour service contour --template="{{range .status.loadBalancer.ingress}}{{.ip}}{{end}}")
+    # done
+    # echo "IP Address is ""${external_ip}"" "
+
+    # Create a new DNS Record if requested
+
+    if [[ "${create_dns}" == "true" ]]; then
+        if [[ "${dns_delete_existing_records}" == "true" ]]; then
+            for addr in $(az network dns record-set a list --resource-group dnszone --zone-name simongdavies.co.uk |jq -r '.[].arecords[].ipv4Address'); do 
+                echo "Attempting to delete DNS Record: Resource Group: ""${CNAB_P_DNS_ZONE_RG}"" Zone: ""${CNAB_P_DNS_ZONE_NAME}"" Name: ""${CNAB_P_DNS_RECORD_NAME}"" Address: ""${addr}"" "
+                az network dns record-set a remove-record -g "${CNAB_P_DNS_ZONE_RG}" -z "${CNAB_P_DNS_ZONE_NAME}" -n "${CNAB_P_DNS_RECORD_NAME}" -a "${addr}" > /dev/null
+            done
+        fi
+        echo "Creating a DNS record"
+        az network dns record-set a add-record -g "${CNAB_P_DNS_ZONE_RG}" -z "${CNAB_P_DNS_ZONE_NAME}" -n "${CNAB_P_DNS_RECORD_NAME}" -a "${external_ip}"
+        app_domain="${CNAB_P_DNS_RECORD_NAME}.${CNAB_P_DNS_ZONE_NAME}"
+    fi
+
+    # TODO: Set up IP Address rule for Azure MySQL DB 
+
+    # Set up RBAC for Helm
+
+    kubectl apply -f "${BASH_SOURCE%/*}/helm-rbac.yaml"
+
+    helm init --service-account tiller --wait
+
+    if [[ "${enable_https}" == "true" ]]; then
+
+        # Install cert-manager
+
+        echo "Installing Cert-Manager"
+        # Workaround for https://github.com/jetstack/cert-manager/issues/1144 
+
+        helm install stable/cert-manager --name "${name}-cert-manager" --set ingressShim.defaultIssuerName=letsencrypt-staging --set ingressShim.defaultIssuerKind=ClusterIssuer --wait --set createCustomResource=false 
+        helm upgrade "${name}-cert-manager" stable/cert-manager --set createCustomResource=true --wait
+
+        envsubst < "${BASH_SOURCE%/*}/cluster-issuer.yaml"| kubectl apply -f -
+        envsubst < "${BASH_SOURCE%/*}/certificate.yaml"| kubectl apply -f -
+
+    fi
+
+    # create a PVC on Azure Files for Wordpress
+
+    # create a secret
+
+    export file_share_secret_name="${file_share_storage_account_name}-secret"
+    export storage_class_name="${resource_group_name}-${cluster_name}-files"
+    export pv_name="${resource_group_name}-${cluster_name}-pv"
+
+    echo "Creating a Secret"
+
+    kubectl create secret generic  "${file_share_secret_name}" --from-literal=azurestorageaccountname="${file_share_storage_account_name}" --from-literal=azurestorageaccountkey="${file_share_storage_account_key}" 
+
+    # create a PV
+
+    echo "Creating a Persistent Volume"
+
+    envsubst < "${BASH_SOURCE%/*}/persistent-volume.yaml"| kubectl apply -f -
+
+    # create a PVC
+
+    echo "Creating a Persistent Volume Claim"
+
+    envsubst < "${BASH_SOURCE%/*}/persistent-volume-claim.yaml"| kubectl apply -f -
+ 
+    # Install Wordpress
+
+    echo "Installing Wordpress"
+
+    # OVerride Wordpress tag see https://github.com/bitnami/bitnami-docker-wordpress/issues/136
+    # TODO Remove this when the fix is in the Helm Chart
+
+    export CNAB_P_WORDPRESS_TAG=4.9.8-debian-9-r81
+
+    envsubst < "${BASH_SOURCE%/*}/wordpress-config-values.yaml" |helm install stable/wordpress --wait --debug -f - --set image.tag=${CNAB_P_WORDPRESS_TAG}
+
+    printf "Wordpress is available at:\n\n\t%s\n\n" "http://""${app_domain}"""
+    printf "Get Admin Credentials for cluster:\n\n\t%s\n\n" "az aks get-credentials -g ""${resource_group_name}"" -n ""${cluster_name}"" --admin --overwrite-existing"
+    printf "Browse to the Kubernetes dashboard:\n\n1. Set up Permissions:\n\n\tkubectl create clusterrolebinding kubernetes-dashboard --clusterrole=cluster-admin --serviceaccount=kube-system:kubernetes-dashboard\n\n"
+    printf "2. Launch Dashboard:\n\n\t%s\n\n" "az aks browse -g ""${resource_group_name}"" -n ""${cluster_name}"" "
+}
+
+translate_vars
+
+export init_backend="${TF_VAR_backend:-false}"
+
+if [[ "${init_backend}" == "true" ]]; then
+    echo "Initializing resources for Terraform's backend storage"
+    source "${BASH_SOURCE%/*}/init-backend"
+fi
+
+cd $tfdir
+terraform init \
+    -backend="${init_backend}" \
+    -backend-config="storage_account_name=${TF_VAR_backend_storage_account}" \
+    -backend-config="container_name=${TF_VAR_backend_storage_container}" \
+    -backend-config="key=${name}.tfstate" \
+    -backend-config="resource_group_name=${TF_VAR_backend_storage_resource_group}" \
+    -backend-config="arm_subscription_id=${TF_VAR_subscription_id}" \
+    -backend-config="arm_client_id=${TF_VAR_client_id}" \
+    -backend-config="arm_client_secret=${TF_VAR_client_secret}" \
+    -backend-config="arm_tenant_id=${TF_VAR_tenant_id}" \
+    -reconfigure
+
+export TF_VAR_installation_name=$name
+
+case $action in
+    install)
+        echo "Creating the Application"
+        install_or_update_app
+        ;;
+    uninstall)
+        echo "Destroying the Application"
+        terraform destroy -auto-approve
+        ;;
+    upgrade)
+        echo "Upgrading the Application"
+        install_or_update_app
+        ;;
+    status)
+        echo "Application Status"
+        terraform plan
+        ;;
+    *)
+        echo "No action for $action"
+        ;;
+esac
+echo "Action $action complete for $name"

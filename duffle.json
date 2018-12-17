@@ -1,0 +1,123 @@
+{
+    "name": "test",
+    "version": "0.1.0",
+    "description": "A test bundle",
+    "keywords": [
+        "test",
+        "cnab",
+        "tutorial"
+    ],
+    "maintainers": [{
+        "name": "Simon Davies",
+        "email": "simongdavies@hotmail.com"
+    }],
+    "invocationImages": {
+        "cnab": {
+            "name": "cnab",
+            "builder": "docker",
+            "configuration": {
+                "registry": "simongdavies"
+            }
+        }
+    },
+    "parameters": {
+        "backend": {
+            "type": "boolean",
+            "defaultValue": false
+        },
+        "cluster_admin_user": {
+            "type": "string",
+            "defaultValue":"clusteradmin"
+        },
+        "location": {
+            "type": "string",
+            "defaultValue":"ukwest"
+        },
+        "cluster_agent_count": {
+            "type": "int",
+            "defaultValue":3
+        },
+        "cluster_agent_vm_size": {
+            "type": "string",
+            "defaultValue": "Standard_D4s_v3"
+        },
+        "cluster_agent_disk_size_gb": {
+            "type": "int",
+            "defaultValue":30
+        },
+        "kubernetes_version": {
+            "type": "string",
+            "defaultValue": "1.11.5"
+        },
+        "cluster_name": {
+            "type": "string",
+            "defaultValue": ""
+        },
+        "cluster_dns_prefix": {
+            "type": "string",
+            "defaultValue": ""
+        },
+        "create_dns": {
+            "type": "boolean",
+            "defaultValue": true
+        },
+        "dns_zone_rg": {
+            "type": "string",
+            "defaultValue": ""
+        },
+        "dns_zone_name": {
+            "type": "string",
+            "defaultValue": ""
+        },
+        "dns_record_name": {
+            "type": "string",
+            "defaultValue": "www"
+        },
+        "dns_delete_existing_records": {
+            "type": "boolean",
+            "defaultValue": true
+        },
+        "enable_https":{
+            "type": "boolean",
+            "defaultValue": true
+        },
+        "cert_email_address" :{
+            "type": "string",
+            "defaultValue": ""
+        },
+        "wordpress_database_name" : {
+            "type" : "string",
+            "defaultValue": "wpdatabase"
+        },
+
+        "wordpress_repository_name" : {
+            "type" : "string",
+            "defaultValue": "bitnami/wordpress"
+        },
+        "wordpress_tag" : {
+            "type" : "string",
+            "defaultValue": "latest"
+        },
+        "wordpress_relica_count" : {
+            "type" : "int",
+            "defaultValue": 1
+        }
+    },
+    "credentials": {
+        "tenant_id": {
+            "env": "TF_VAR_tenant_id"
+        },
+        "client_id": {
+            "env": "TF_VAR_client_id"
+        },
+        "client_secret": {
+            "env": "TF_VAR_client_secret"
+        },
+        "subscription_id": {
+            "env": "TF_VAR_subscription_id"
+        },
+        "cluster_ssh_key_data": {
+            "env": "TF_VAR_cluster_ssh_key_data"
+        }
+    }
+}
