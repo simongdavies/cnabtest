@@ -1,3 +1,24 @@
+# Configure Providers
+
+provider "random" {
+  version         = "~> 2.0"
+}
+
+provider "azurerm" {
+  version         = "~> 1.20"
+  subscription_id = "${var.subscription_id}"
+  client_id       = "${var.client_id}"
+  client_secret   = "${var.client_secret}"
+  tenant_id       = "${var.tenant_id}"
+}
+
+provider "azuread" {
+  version = "=0.1.0"
+  subscription_id = "${var.subscription_id}"
+  client_id       = "${var.client_id}"
+  client_secret   = "${var.client_secret}"
+  tenant_id       = "${var.tenant_id}"
+}
 variable "installation_name" {
   default = "aks-contour"
 }
@@ -8,6 +29,10 @@ variable "subscription_id" {
 
 variable "client_id" {
   type = "string"
+}
+
+variable "client_ip_address" {
+   type = "string"
 }
 
 variable "client_secret" {
@@ -58,6 +83,19 @@ variable "wordpress_database_name" {
   type = "string"
 }
 
+variable "create_dns" {
+  default = false
+}
+
+variable "use_keyvault" {
+  default = false
+}
+
+variable  "keyvault_name" {
+  type = "string"
+}
+
+
 resource "random_string" "name_suffix" {
   length  = 15
   special = false
@@ -71,18 +109,9 @@ resource "random_string" "name_suffix" {
 
 locals {
   cluster_name       = "${length(var.cluster_name)==0 ? "aks-${random_string.name_suffix.result}": var.cluster_name}"
+  kv_name       = "${length(var.keyvault_name)==0 ? "kv${random_string.name_suffix.result}":var.keyvault_name}"
   cluster_dns_prefix = "${length(var.cluster_dns_prefix)==0 ? random_string.name_suffix.result : var.cluster_dns_prefix}"
   wordpress_domain_name_label="${length(var.cluster_dns_prefix)==0 ? "wp-${random_string.name_suffix.result}" : "wp-${var.cluster_dns_prefix}"}" 
-}
-
-# Configure the Microsoft Azure Provider
-
-provider "azurerm" {
-  version         = "~> 1.20"
-  subscription_id = "${var.subscription_id}"
-  client_id       = "${var.client_id}"
-  client_secret   = "${var.client_secret}"
-  tenant_id       = "${var.tenant_id}"
 }
 
 resource "azurerm_resource_group" "k8s" {
@@ -90,21 +119,7 @@ resource "azurerm_resource_group" "k8s" {
   location = "${var.location}"
 }
 
-# Remove these when TF supports RBAC without AAD in 1.20
-
-# resource "null_resource" "k8s" {
-#   provisioner "local-exec" {
-#     command = <<EOF
-#       az login --service-principal --username "${var.client_id}" --password "${var.client_secret}" --tenant "${var.tenant_id}"
-#       az aks create --name ${local.cluster_name} --resource-group ${azurerm_resource_group.k8s.name} --location ${azurerm_resource_group.k8s.location} \
-#       --ssh-key-value "${var.cluster_ssh_key_data}" --client-secret ${var.client_secret} --service-principal ${var.client_id} --admin-username ${var.cluster_admin_user} --nodepool-name default \
-#       --dns-name-prefix ${local.cluster_dns_prefix}  --node-count ${var.cluster_agent_count} --kubernetes-version ${var.kubernetes_version} --node-vm-size ${var.cluster_agent_vm_size} --node-osdisk-size ${var.cluster_agent_disk_size_gb}
-#     EOF
-#   }
-# }
-
-# Commented out until TF supports RBAC without AAD in 1.20
-# See https://github.com/terraform-providers/terraform-provider-azurerm/pull/2347
+// TODO: Enable VNet deployment
 
 resource "azurerm_kubernetes_cluster" "k8s" {
   name                = "${local.cluster_name}"
@@ -132,15 +147,48 @@ resource "azurerm_kubernetes_cluster" "k8s" {
     client_id     = "${var.client_id}"
     client_secret = "${var.client_secret}"
   }
-
  # This should be supported in 1.20 of TF provider.
-
   role_based_access_control {
     enabled = true
   }
 
 }
+data "azuread_service_principal" "sp" {
+  application_id = "${var.client_id}"
+}
 
+resource "azurerm_key_vault" "cert_vault" {
+  count                       = "${var.use_keyvault?1:0}"
+  name                        = "${local.kv_name}"
+  location                    = "${azurerm_resource_group.k8s.location}"
+  resource_group_name         = "${azurerm_resource_group.k8s.name}"
+  tenant_id                   = "${var.tenant_id}"
+  sku {
+    name = "standard"
+  }
+
+  access_policy {
+    tenant_id = "${var.tenant_id}"
+    object_id = "${data.azuread_service_principal.sp.id}"
+
+    certificate_permissions = [
+      "get","create","update","import"
+    ]
+
+    secret_permissions = [
+      "get","set"
+    ]
+  }
+
+  network_acls {
+    default_action = "Deny"
+    bypass         = "None"
+    ip_rules      = [
+      "${var.client_ip_address}"
+    ]
+  }
+
+}
 resource "random_string" "sa_name" {
   length = 23
   special = false
@@ -202,16 +250,16 @@ resource "azurerm_public_ip" "aks_public_ip" {
   name                          = "aks_public_ip"
   resource_group_name           = "${azurerm_kubernetes_cluster.k8s.node_resource_group}"
   location                      = "${azurerm_resource_group.k8s.location}"
-  public_ip_address_allocation  = "static"
-  domain_name_label ="${local.wordpress_domain_name_label}"
+  allocation_method             = "Static"
+  domain_name_label             ="${local.wordpress_domain_name_label}"
 }
 
-resource "azurerm_mysql_firewall_rule" "azure_services" {
-  name                = "azure_services"
+resource "azurerm_mysql_firewall_rule" "egress_ip" {
+  name                = "egress_ip"
   resource_group_name = "${azurerm_resource_group.k8s.name}"
   server_name         = "${azurerm_mysql_server.wordpress_sql.name}"
-  start_ip_address    = "0.0.0.0"
-  end_ip_address      = "0.0.0.0"
+  start_ip_address    = "${azurerm_public_ip.aks_public_ip.ip_address}"
+  end_ip_address      = "${azurerm_public_ip.aks_public_ip.ip_address}"
 }
 
 resource "azurerm_mysql_database" "wordpress_db" {
@@ -227,6 +275,9 @@ output "resource_group_name" {
 }
 output "cluster_name" {
   value = "${azurerm_kubernetes_cluster.k8s.name}"
+}
+output "keyvault_name" {
+  value = "${local.kv_name}"
 }
 output "file_share_name" {
   value = "${azurerm_storage_share.wp_filesshare.name}"
@@ -251,4 +302,7 @@ output  "externalDatabase_database" {
 }
 output  "public_ip_address" {
   value = "${azurerm_public_ip.aks_public_ip.ip_address}"
+}
+output  "fqdn" {
+  value = "${azurerm_public_ip.aks_public_ip.fqdn}"
 }

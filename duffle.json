@@ -47,7 +47,7 @@
         },
         "kubernetes_version": {
             "type": "string",
-            "defaultValue": "1.11.5"
+            "defaultValue": "1.11.7"
         },
         "cluster_name": {
             "type": "string",
@@ -59,7 +59,7 @@
         },
         "create_dns": {
             "type": "boolean",
-            "defaultValue": true
+            "defaultValue": false
         },
         "dns_zone_rg": {
             "type": "string",
@@ -89,7 +89,6 @@
             "type" : "string",
             "defaultValue": "wpdatabase"
         },
-
         "wordpress_repository_name" : {
             "type" : "string",
             "defaultValue": "bitnami/wordpress"
@@ -100,7 +99,68 @@
         },
         "wordpress_relica_count" : {
             "type" : "int",
-            "defaultValue": 1
+            "defaultValue": 3
+        },
+        "certificate_type":{
+            "type":"string",
+            "allowedValues" :
+            [
+                "prod",
+                "staging"
+            ],
+            "defaultValue" :"staging"
+        },
+        "ingress_type":{
+            "type":"string",
+            "allowedValues" :
+            [
+                "nginx",
+                "contour"
+            ],
+            "defaultValue" :"contour"
+        },
+        "namespace":{
+            "type":"string",
+            "defaultValue" :"wordpress"
+        },
+        "wordpress_username":
+        {
+            "type" :"string",
+            "defaultValue": "CNAB"
+        },
+        "wordpress_password":
+        {
+            "type" :"string"
+        },
+        "wordpress_email":
+        {
+            "type" :"string",
+            "defaultValue": "cnab@contoso.com"
+        },
+        "wordpress_firstname":
+        {
+            "type" :"string",
+            "defaultValue": "cnab"
+        },
+        "wordpress_lastname":
+        {
+            "type" :"string",
+            "defaultValue": "user"
+        },
+        "wordpress_blogname":
+        {
+            "type" :"string",
+            "defaultValue": "A cnab user's blog"
+        },
+        "use_keyvault":
+        {
+            "type": "boolean",
+            "defaultValue": true
+        },
+        "keyvault_name":
+        {
+            "type" :"string",
+            "defaultValue": ""
         }
     },
     "credentials": {

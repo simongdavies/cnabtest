@@ -1,4 +1,10 @@
 allowEmptyPassword: false
+wordpressUsername: ${CNAB_P_WORDPRESS_USERNAME}
+wordpressPassword: ${wordpress_password}
+wordpressEmail: ${CNAB_P_WORDPRESS_EMAIL}
+wordpressFirstName: ${CNAB_P_WORDPRESS_FIRSTNAME}
+wordpressLastName: ${CNAB_P_WORDPRESS_LASTNAME}
+wordpressBlogName: ${CNAB_P_WORDPRESS_BLOGNAME}
 mariadb:
   enabled: false
 livenessProbe:
@@ -14,8 +20,8 @@ readinessProbe:
   successThreshold: 1
   failureThreshold: 10
 image:
-  repository: ${CNAB_P_WORDPRESS_REPOSITORY_NAME}
-  tag: ${CNAB_P_WORDPRESS_TAG}
+  repository: ${wordpress_repository_name}
+  tag: ${wordpress_tag}
 externalDatabase:
   host: ${externalDatabase_host}
   user: ${externalDatabase_user}
@@ -25,13 +31,16 @@ externalDatabase:
 persistence:
   existingClaim: ${pv_name}
 replicaCount: ${CNAB_P_WORDPRESS_RELICA_COUNT}
-ingress: 
-  enabled: true
 service:
   type: ClusterIP
-smtpHost: null
-smtpPort: null
-smtpUser: null
-smtpPassword: null
-smtpProtocol: null
-smtpUsername: null
+ingress:
+  enabled: true
+  hosts:
+  - name: ${app_domain}
+    tls: ${enable_https}
+    certManager: ${enable_https}
+    tlsSecret: ${app_domain}-tls
+    annotations:
+      kubernetes.io/ingress.class: ${ingress_type}
+      certmanager.k8s.io/cluster-issuer: ${cert_issuer}
+      kubernetes.io/tls-acme: true

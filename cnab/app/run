@@ -1,10 +1,16 @@
 #!/bin/bash
 set -e
-
+echo "Action $action started for $name at: $(date)"
+started=$SECONDS
 action=$CNAB_ACTION
 name=$CNAB_INSTALLATION_NAME 
 tfdir=/cnab/app/tf/
+timeout=1800
+wp_deployment_timeout=3600
 export app_domain="wordpress.local"
+tls_hostname="tiller"
+export resource_group_name=$name
+
 
 # translate_vars translates all env vars prefixed by CNAB_P_ into corresponding TF_VAR_ env vars, as used by Terraform
 # e.g., CNAB_P_LOCATION becomes TF_VAR_location
@@ -14,15 +20,27 @@ function translate_vars() {
 
     for cnab_var in $(compgen -v "${cnab_prefix}"); do
         var="$(echo "${cnab_var#${cnab_prefix}}" | awk '{print tolower($0)}')"
-        echo "TF_VAR_${var}=${!cnab_var}"
         export "TF_VAR_${var}"="${!cnab_var}"
+        echo "TF_VAR_${var}=${!cnab_var}"
     done
 }
 
-function install_or_update_app() {
+function install_app() {
+    
+    translate_vars
     
     export create_dns="${CNAB_P_CREATE_DNS:-false}"
-
+    export ingress_type="${CNAB_P_INGRESS_TYPE:-contour}"
+    export wordpress_repository_name=${CNAB_P_WORDPRESS_REPOSITORY_NAME-bitnami/wordpress}
+    export wordpress_tag=${CNAB_P_WORDPRESS_TAG:-latest}
+    export certificate_type=${CNAB_P_CERTIFICATE_TYPE:-staging}
+    export wordpress_password=${CNAB_P_WORDPRESS_PASSWORD:-$(openssl rand -hex 10)}
+    export namespace=${CNAB_P_NAMESPACE:-wordpress}
+    export use_keyvault="${CNAB_P_USE_KEYVAULT:-false}"
+    export TF_VAR_installation_name=$name   
+    export init_backend="${TF_VAR_backend:-false}"
+    export TF_VAR_client_ip_address=$(curl ifconfig.co)
+    
     # if a DNS Record is to be created then we need the RG zone and record name for Azure DNS
 
     if [[ "${create_dns}" == "true" ]]; then
@@ -35,22 +53,24 @@ function install_or_update_app() {
     export enable_https="${CNAB_P_ENABLE_HTTPS:-false}"
 
     if [[ "${enable_https}" == "true" ]]; then
-        if [[ "${create_dns}" != "true" ]]; then
-            echo "Must create a DNS record to use HTTPS"
-            exit 1
-        fi
-        # TODO: Validate the email address
         : "${CNAB_P_CERT_EMAIL_ADDRESS:?cert_email_address should be set}"
     fi
 
-    # Create or update the resources using TF
+    # Login with the Azure CLI and set the subscription
+        
+    az login --service-principal --username "${TF_VAR_client_id}" --password "${TF_VAR_client_secret}" --tenant "${TF_VAR_tenant_id}" 
+    az account set --subscription "${TF_VAR_subscription_id}" 
 
-    terraform apply -auto-approve -input=false
+    # Create  the resources using TF
+
+    terraform init $tfdir
+
+    terraform apply -auto-approve -input=false  $tfdir
 
     # Get the outputs from the TF config
 
-    export resource_group_name="$(terraform output resource_group_name)"
     export cluster_name="$(terraform output cluster_name)"
+    export kv_name="$(terraform output keyvault_name)"
     export file_share_name="$(terraform output file_share_name)"
     export file_share_storage_account_name="$(terraform output file_share_storage_account_name)"
     export file_share_storage_account_key="$(terraform output file_share_storage_account_key)"
@@ -59,66 +79,219 @@ function install_or_update_app() {
     export externalDatabase_password="$(terraform output externalDatabase_password)"
     export externalDatabase_database="$(terraform output externalDatabase_database)"
     export external_ip="$(terraform output public_ip_address)"
+    export fqdn="$(terraform output fqdn)"
 
-    # Login with the Azure CLI and get the kubernetes config
+    # Get the kubernetes config
+
+    az aks get-credentials --resource-group "${resource_group_name}" --name "${cluster_name}" --admin --overwrite-existing 
+
+    # Create namespace for helm and applications
+
+    kubectl create namespace "${namespace}"
+
+    # Service Account for Tiller
+
+    kubectl create serviceaccount tiller --namespace="${namespace}"
+
+    # Roles and Bindings for Tiller, NGinx, CertMgr, Wordpress
+
+    kubectl create role multi-all  --verb='*' --resource='services,deployments,configmaps,secrets,persistentvolumeclaims,poddisruptionbudgets,serviceaccounts,namespaces,endpoints,pods,roles,rolebindings,events' --namespace="${namespace}"
+    kubectl create role ingress-list-watch-get  --verb='list,watch,get' --resource='ingresses.extensions' --namespace="${namespace}"
+    kubectl create role ingress-status-update  --verb='update' --resource='ingresses.extensions/status' --namespace="${namespace}"
+    kubectl create role apps-get-create-patch --verb='get,create,patch' --resource='deployments.apps' --namespace="${namespace}"
+    kubectl create role replicasets-list --verb='list' --resource='replicasets.apps' --namespace="${namespace}"
+    
+    kubectl create rolebinding tiller-multi-all --role=multi-all --serviceaccount="${namespace}:tiller" --namespace="${namespace}"
+    kubectl create rolebinding tiller-ingress-list-watch-get --role=ingress-list-watch-get --serviceaccount="${namespace}:tiller" --namespace="${namespace}"
+    kubectl create rolebinding tiller-ingress-status-update --role=ingress-status-update --serviceaccount="${namespace}:tiller" --namespace="${namespace}"
+    kubectl create rolebinding tiller-apps-get-create-patch --role=apps-get-create-patch --serviceaccount="${namespace}:tiller" --namespace="${namespace}"
+    kubectl create rolebinding tiller-replicasets-list --role=replicasets-list --serviceaccount="${namespace}:tiller" --namespace="${namespace}"
+
+    kubectl create clusterrole multi-get --verb=get --resource='namespaces,nodes'
+    kubectl create clusterrole customresourcedefinitions-get-create --verb='get,create' --resource='customresourcedefinitions.apiextensions'
+    kubectl create clusterrole node-list-watch --verb='list,watch' --resource='nodes'
+    kubectl create clusterrole multi-all --verb='*' --resource='clusterrole,clusterrolebinding,services,events,configmaps,secrets,pods,ingresses.extensions' 
+    kubectl create clusterrole apiservices-get-update --verb=get,update --resource=apiservices.apiregistration
+    kubectl create clusterrole validatingwebhookconfigurations-get-update --verb=get,update --resource=validatingwebhookconfigurations.admissionregistration --resource-name="${name}-cert-manager-webhook"
+    kubectl create clusterrole mutatingwebhookconfigurations-get-update --verb=get,update --resource=mutatingwebhookconfigurations.admissionregistration --resource-name="${name}-cert-manager-webhook"
+    
+    kubectl create clusterrolebinding tiller-multi-get --clusterrole=multi-get  --serviceaccount="${namespace}:tiller"
+    kubectl create clusterrolebinding tiller-customresourcedefinitions-get-create --clusterrole=customresourcedefinitions-get-create --serviceaccount="${namespace}:tiller"
+    kubectl create clusterrolebinding tiller-node-list-watch --clusterrole=node-list-watch --serviceaccount="${namespace}:tiller"
+    kubectl create clusterrolebinding tiller-multi-all --clusterrole=multi-all --serviceaccount="${namespace}:tiller"
+    kubectl create clusterrolebinding tiller-apiservices-get-update --clusterrole=apiservices-get-update --serviceaccount="${namespace}:tiller"
+    kubectl create clusterrolebinding tiller-validatingwebhookconfigurations-get-update --clusterrole=validatingwebhookconfigurations-get-update --serviceaccount="${namespace}:tiller"
+    kubectl create clusterrolebinding tiller-mutatingwebhookconfigurations-get-update --clusterrole=mutatingwebhookconfigurations-get-update --serviceaccount="${namespace}:tiller"
+
+    # Set default namespace
+
+    kubectl config set-context "$(kubectl config current-context)" --namespace="${namespace}"
+
+    # Setup certificates and keys for Helm and Tiller TLS
+
+        cat >> /etc/ssl/openssl.cnf <<-EOF
+        [ v3_ca ]
+        basicConstraints = critical,CA:TRUE
+        subjectKeyIdentifier = hash
+        authorityKeyIdentifier = keyid:always,issuer:always
+EOF
+
+        echo "Creating CA Cert and Key"
+
+        # Create Self Signed Root CA Cert
+
+        openssl genrsa -out "${BASH_SOURCE%/*}/ca.key.pem" 4096
+        openssl req -x509 -new -nodes -sha256 -key "${BASH_SOURCE%/*}/ca.key.pem" -days 365 -out "${BASH_SOURCE%/*}/ca.cert.pem"  -extensions v3_ca -subj '/CN=tiller-CA'
+
+    if [[ "${use_keyvault}" == "true" ]]; then
+
+        # KeyVault
+        # Doesn't seem like its possible to create a signing cert with CA Bit in Key Vault set so use locally created one and import as pfx
+
+        echo "Uploading CA Cert to Keyvault"
+
+        openssl pkcs12 -inkey "${BASH_SOURCE%/*}/ca.key.pem" -in "${BASH_SOURCE%/*}/ca.cert.pem" -export  -passin pass: -passout pass: -out "${BASH_SOURCE%/*}/ca.pfx"
+        az keyvault certificate import --vault-name "${kv_name}" --name "ca-${namespace}" --file  "${BASH_SOURCE%/*}/ca.pfx" 
+
+        # Create Tiller Cert
+
+        echo "Creating Tiller Certificate"
+
+        export subject="CN=${tls_hostname}"
+        policy=$(envsubst < "${BASH_SOURCE%/*}/kv-certreq.json")
+        az keyvault certificate create --vault-name "${kv_name}" --name "tiller-${namespace}" --policy "${policy}"
+        csr=$(az keyvault certificate pending show --vault-name "${kv_name}" --name "tiller-${namespace}" --output tsv --query csr)
+        printf "%s\\n%s\\n%s\\n" "-----BEGIN CERTIFICATE REQUEST-----" "${csr}" "-----END CERTIFICATE REQUEST-----" > "${BASH_SOURCE%/*}/tiler.csr"
+        openssl x509 -req -out "${BASH_SOURCE%/*}/tiller.cert.pem" -CA "${BASH_SOURCE%/*}/ca.cert.pem"  -CAkey "${BASH_SOURCE%/*}/ca.key.pem" -CAcreateserial -days 365 -in "${BASH_SOURCE%/*}/tiler.csr"
+        az keyvault certificate pending merge --vault-name "${kv_name}" --name "tiller-${namespace}" --file "${BASH_SOURCE%/*}/tiller.cert.pem"
+        az keyvault secret show --vault-name "${kv_name}" --name "tiller-${namespace}" --output tsv --query value |base64 -d|openssl pkcs12 -nodes -nocerts -passin pass: -passout pass: -out "${BASH_SOURCE%/*}/tiller.key.pem"
+
+        # Create Helm Cert
+
+        echo "Creating Helm Certificate"
+
+        export subject="CN=helm"
+        policy=$(envsubst < "${BASH_SOURCE%/*}/kv-certreq.json")
+        az keyvault certificate create --vault-name "${kv_name}" --name "helm-${namespace}" --policy "${policy}"
+        csr=$(az keyvault certificate pending show --vault-name "${kv_name}" --name "helm-${namespace}" --output tsv --query csr)
+        printf "%s\\n%s\\n%s\\n" "-----BEGIN CERTIFICATE REQUEST-----" "${csr}" "-----END CERTIFICATE REQUEST-----" > "${BASH_SOURCE%/*}/helm.csr"
+        openssl x509 -req -out "${BASH_SOURCE%/*}/helm.cert.pem" -CA "${BASH_SOURCE%/*}/ca.cert.pem"  -CAkey "${BASH_SOURCE%/*}/ca.key.pem" -CAcreateserial -days 365 -in "${BASH_SOURCE%/*}/helm.csr"
+        az keyvault certificate pending merge --vault-name "${kv_name}" --name "helm-${namespace}" --file "${BASH_SOURCE%/*}/helm.cert.pem"
+        az keyvault secret show --vault-name "${kv_name}" --name  "helm-${namespace}" --output tsv --query value |base64 -d|openssl pkcs12 -nodes -nocerts -passin pass: -passout pass: -out "${BASH_SOURCE%/*}/helm.key.pem"
+    
+    else
+
+        # No Key Vault
+
+        # Create Tiller Cert
+
+        echo "Creating Tiller Certificate"
         
-    az login --service-principal --username "${TF_VAR_client_id}" --password "${TF_VAR_client_secret}" --tenant "${TF_VAR_tenant_id}"
-    az account set --subscription "${TF_VAR_subscription_id}"
-    az aks get-credentials --resource-group "${resource_group_name}" --name "${cluster_name}" --admin 
-    
-    # Install Contour
-    
-    # echo "Installing Contour"
+        openssl genrsa -out "${BASH_SOURCE%/*}/tiller.key.pem" 4096
+        openssl req -new -sha256 -key "${BASH_SOURCE%/*}/tiller.key.pem" -out "${BASH_SOURCE%/*}/tiller.csr" -subj "/CN=${tls_hostname}"
+        openssl x509 -req -in "${BASH_SOURCE%/*}/tiller.csr" -out "${BASH_SOURCE%/*}/tiller.cert.pem" -CA "${BASH_SOURCE%/*}/ca.cert.pem"  -CAkey "${BASH_SOURCE%/*}/ca.key.pem" -CAcreateserial -days 365 -extensions v3_ext
 
-    # No Helm chart for Contour yet
-    # See https://github.com/helm/charts/pull/7385 
+        # Create Helm Cert
 
-    envsubst < "${BASH_SOURCE%/*}/contour/contour-deployment-rbac.yaml" | kubectl apply -f -
+        echo "Creating Helm Certificate"
+        
+        openssl genrsa -out "${BASH_SOURCE%/*}/helm.key.pem" 4096
+        openssl req -new -sha256 -key "${BASH_SOURCE%/*}/helm.key.pem" -out "${BASH_SOURCE%/*}/helm.csr" -subj '/CN=helm'
+        openssl x509 -req -in "${BASH_SOURCE%/*}/helm.csr" -out "${BASH_SOURCE%/*}/helm.cert.pem" -CA "${BASH_SOURCE%/*}/ca.cert.pem" -CAkey "${BASH_SOURCE%/*}/ca.key.pem" -CAcreateserial -days 365 -extensions v3_ext
+
+    fi
+
+    echo "Initialisng Helm"
+
+    helm init --service-account=tiller --override 'spec.template.spec.containers[0].command'='{/tiller,--storage=secret}' --tiller-namespace="${namespace}"  --wait --tiller-tls-cert="${BASH_SOURCE%/*}/tiller.cert.pem" --tiller-tls-key="${BASH_SOURCE%/*}/tiller.key.pem" --tiller-tls-verify --tls-ca-cert="${BASH_SOURCE%/*}/ca.cert.pem" --tiller-tls-hostname="${tls_hostname}"
     
-    # Wait for external IP address to be assigned
+    cp "${BASH_SOURCE%/*}/ca.cert.pem" "$(helm home)/ca.pem"
+    cp "${BASH_SOURCE%/*}/helm.cert.pem" "$(helm home)/cert.pem"
+    cp "${BASH_SOURCE%/*}/helm.key.pem" "$(helm home)/key.pem"
+
+    # Install contour or nginx
+ 
+    if [[ "${ingress_type}" == "contour" ]]; then
     
-    # while [[ -z "${external_ip}" ]]; do
-    #     sleep 10
-    #     echo "Waiting for IP Address assignment for Load Balancer"
-    #     external_ip=$(kubectl get -n heptio-contour service contour --template="{{range .status.loadBalancer.ingress}}{{.ip}}{{end}}")
-    # done
-    # echo "IP Address is ""${external_ip}"" "
+        echo "Installing Contour"
+
+        # No Helm chart for Contour yet
+        # See https://github.com/helm/charts/pull/7385 
+
+        envsubst < "${BASH_SOURCE%/*}/contour/contour-deployment-rbac.yaml" | kubectl apply  -f -
+
+    elif [[ "${ingress_type}" == "nginx" ]]; then
+
+        # Service Account/Roles/Bindings for nginx
+
+        kubectl create serviceaccount nginx --namespace="${namespace}"
+        
+        echo "Installing Nginx"
+
+        helm install stable/nginx-ingress --tls-verify --tls-hostname="${tls_hostname}" --set serviceAccount.create="false" --set serviceAccount.name="nginx" --set controller.service.loadBalancerIP="${external_ip}"  --set controller.replicaCount=2 --set controller.scope.enabled="true" --set controller.scope.namespace="${namespace}" --tiller-namespace "${namespace}"  --wait --timeout="${timeout}" --namespace="${namespace}" 
+
+    else
+        
+        printf "Invalid Ingress Type: %s \n"  "${ingress_type}"
+        exit 1
+    
+    fi
 
     # Create a new DNS Record if requested
 
     if [[ "${create_dns}" == "true" ]]; then
         if [[ "${dns_delete_existing_records}" == "true" ]]; then
-            for addr in $(az network dns record-set a list --resource-group dnszone --zone-name simongdavies.co.uk |jq -r '.[].arecords[].ipv4Address'); do 
+            for addr in $(az network dns record-set a list --resource-group "${CNAB_P_DNS_ZONE_RG}" --zone-name "${CNAB_P_DNS_ZONE_NAME}" |jq -r '.[].arecords[].ipv4Address'); do 
                 echo "Attempting to delete DNS Record: Resource Group: ""${CNAB_P_DNS_ZONE_RG}"" Zone: ""${CNAB_P_DNS_ZONE_NAME}"" Name: ""${CNAB_P_DNS_RECORD_NAME}"" Address: ""${addr}"" "
-                az network dns record-set a remove-record -g "${CNAB_P_DNS_ZONE_RG}" -z "${CNAB_P_DNS_ZONE_NAME}" -n "${CNAB_P_DNS_RECORD_NAME}" -a "${addr}" > /dev/null
+                az network dns record-set a remove-record -g "${CNAB_P_DNS_ZONE_RG}" -z "${CNAB_P_DNS_ZONE_NAME}" -n "${CNAB_P_DNS_RECORD_NAME}" -a "${addr}" 
             done
         fi
         echo "Creating a DNS record"
-        az network dns record-set a add-record -g "${CNAB_P_DNS_ZONE_RG}" -z "${CNAB_P_DNS_ZONE_NAME}" -n "${CNAB_P_DNS_RECORD_NAME}" -a "${external_ip}"
-        app_domain="${CNAB_P_DNS_RECORD_NAME}.${CNAB_P_DNS_ZONE_NAME}"
+        az network dns record-set a add-record -g "${CNAB_P_DNS_ZONE_RG}" -z "${CNAB_P_DNS_ZONE_NAME}" -n "${CNAB_P_DNS_RECORD_NAME}" -a "${external_ip}" 
+        export app_domain="${CNAB_P_DNS_RECORD_NAME}.${CNAB_P_DNS_ZONE_NAME}"
+    else 
+        export app_domain="${fqdn}"
     fi
-
-    # TODO: Set up IP Address rule for Azure MySQL DB 
-
-    # Set up RBAC for Helm
-
-    kubectl apply -f "${BASH_SOURCE%/*}/helm-rbac.yaml"
-
-    helm init --service-account tiller --wait
 
     if [[ "${enable_https}" == "true" ]]; then
 
+        export cert_issuer="letsencrypt-staging"
+
         # Install cert-manager
+        if [[ "${certificate_type}" == "prod" ]] && [[ "${create_dns}" == "true" ]]; then
+            export cert_issuer_server=" https://acme-v02.api.letsencrypt.org/directory"
+            export cert_issuer="letsencrypt-${certificate_type}"
+        else
+            export cert_issuer_server="https://acme-staging-v02.api.letsencrypt.org/directory"
+        fi
 
-        echo "Installing Cert-Manager"
+        printf "Installing Cert-Manager for letsencrypt-%s\n"  "${certificate_type}"
+
         # Workaround for https://github.com/jetstack/cert-manager/issues/1144 
+        # https://github.com/helm/charts/issues/10949
 
-        helm install stable/cert-manager --name "${name}-cert-manager" --set ingressShim.defaultIssuerName=letsencrypt-staging --set ingressShim.defaultIssuerKind=ClusterIssuer --wait --set createCustomResource=false 
-        helm upgrade "${name}-cert-manager" stable/cert-manager --set createCustomResource=true --wait
+        kubectl apply -f https://raw.githubusercontent.com/jetstack/cert-manager/release-0.6/deploy/manifests/00-crds.yaml
+        kubectl create clusterrole certmanager-all --verb='*' --resource='certificates.certmanager,challenges.certmanager,issuers.certmanager,clusterissuers.certmanager,orders.certmanager,orders.certmanager/finalizers,certificates.certmanager/finalizers' 
+        kubectl create clusterrolebinding tiller-certmanager-all --clusterrole=certmanager-all  --serviceaccount="${namespace}:tiller" 
+        # kubectl create clusterrole multi-create --verb=create --resource='certificates.admission.certmanager,issuers.admission.certmanager,clusterissuers.admission.certmanager'
+        # kubectl create clusterrolebinding tiller-multi-create --clusterrole=amulti-create --serviceaccount="${namespace}:tiller"
+        
 
+        # helm install stable/cert-manager --name="${name}-cert-manager" --tls-verify --tls-hostname="${tls_hostname}"  --set ingressShim.defaultIssuerName="${cert_issuer}" --set ingressShim.defaultIssuerKind=ClusterIssuer --set createCustomResource=false --set rbac.create=false --wait --timeout="${timeout}" --tiller-namespace="${namespace}"  --namespace="${namespace}"
+        
+        # helm install stable/cert-manager --name="${name}-cert-manager" --tls-verify --tls-hostname="${tls_hostname}"  --set ingressShim.defaultIssuerName="${cert_issuer}" --set ingressShim.defaultIssuerKind=ClusterIssuer --set rbac.create=false --wait --timeout="${timeout}" --tiller-namespace="${namespace}"  --namespace="${namespace}"
+        
+        helm install stable/cert-manager --name="${name}-cert-manager" --set webhook.enabled=false --tls-verify --tls-hostname="${tls_hostname}"  --set ingressShim.defaultIssuerName="${cert_issuer}" --set ingressShim.defaultIssuerKind=ClusterIssuer --wait --timeout="${timeout}" --tiller-namespace="${namespace}"  --namespace="${namespace}"
+
+        # Need to create the custom resources before we can set up RBAC for them
+        
+        # helm upgrade "${name}-cert-manager" stable/cert-manager --tls-verify --tls-hostname="${tls_hostname}" --set createCustomResource=true --set rbac.create=false --wait --timeout="${timeout}" --tiller-namespace="${namespace}" --namespace="${namespace}" --dry-run --debug
+
+        
+        # helm upgrade "${name}-cert-manager" stable/cert-manager --tls-verify --tls-hostname="${tls_hostname}" --set rbac.create=true --wait --timeout="${timeout}" --tiller-namespace="${namespace}" --namespace="${namespace}"
+       
         envsubst < "${BASH_SOURCE%/*}/cluster-issuer.yaml"| kubectl apply -f -
         envsubst < "${BASH_SOURCE%/*}/certificate.yaml"| kubectl apply -f -
-
     fi
 
     # create a PVC on Azure Files for Wordpress
@@ -131,7 +304,7 @@ function install_or_update_app() {
 
     echo "Creating a Secret"
 
-    kubectl create secret generic  "${file_share_secret_name}" --from-literal=azurestorageaccountname="${file_share_storage_account_name}" --from-literal=azurestorageaccountkey="${file_share_storage_account_key}" 
+    kubectl create secret generic  "${file_share_secret_name}" --from-literal=azurestorageaccountname="${file_share_storage_account_name}" --from-literal=azurestorageaccountkey="${file_share_storage_account_key}" --namespace="${namespace}"
 
     # create a PV
 
@@ -149,62 +322,50 @@ function install_or_update_app() {
 
     echo "Installing Wordpress"
 
-    # OVerride Wordpress tag see https://github.com/bitnami/bitnami-docker-wordpress/issues/136
+    # Override Wordpress version see https://github.com/bitnami/bitnami-docker-wordpress/issues/136
     # TODO Remove this when the fix is in the Helm Chart
 
-    export CNAB_P_WORDPRESS_TAG=4.9.8-debian-9-r81
+    # export wordpress_tag="4.9.8-debian-9-r81"
+    # envsubst < "${BASH_SOURCE%/*}/wordpress-config-values.yaml"
+    
+    # There is a bug in the latest version of the WordPress Helm Chart that makes it fail when ingress is enabled
+    
+    # envsubst < "${BASH_SOURCE%/*}/wordpress-config-values.yaml" | helm install stable/wordpress --tls-verify --tls-hostname="${tls_hostname}" --name="${name}" --version=5.0.2 --wait --timeout="${timeout}" --tiller-namespace="${namespace}" --namespace="${namespace}" -f -
 
-    envsubst < "${BASH_SOURCE%/*}/wordpress-config-values.yaml" |helm install stable/wordpress --wait --debug -f - --set image.tag=${CNAB_P_WORDPRESS_TAG}
+    envsubst < "${BASH_SOURCE%/*}/wordpress-config-values.yaml" | helm install stable/wordpress --tls-verify --tls-hostname="${tls_hostname}" --name="${name}" --wait --timeout="${timeout}" --tiller-namespace="${namespace}" --namespace="${namespace}" -f -
 
-    printf "Wordpress is available at:\n\n\t%s\n\n" "http://""${app_domain}"""
+    # helm does not seem to wait 
+
+    kubectl patch "deployment/${name}-wordpress" -p "{\"spec\":{\"progressDeadlineSeconds\":${wp_deployment_timeout}}}" --namespace="${namespace}"
+    kubectl rollout status deployment "${name}-wordpress" --namespace="${namespace}" --watch=true
+     
     printf "Get Admin Credentials for cluster:\n\n\t%s\n\n" "az aks get-credentials -g ""${resource_group_name}"" -n ""${cluster_name}"" --admin --overwrite-existing"
     printf "Browse to the Kubernetes dashboard:\n\n1. Set up Permissions:\n\n\tkubectl create clusterrolebinding kubernetes-dashboard --clusterrole=cluster-admin --serviceaccount=kube-system:kubernetes-dashboard\n\n"
     printf "2. Launch Dashboard:\n\n\t%s\n\n" "az aks browse -g ""${resource_group_name}"" -n ""${cluster_name}"" "
 }
 
-translate_vars
-
-export init_backend="${TF_VAR_backend:-false}"
-
-if [[ "${init_backend}" == "true" ]]; then
-    echo "Initializing resources for Terraform's backend storage"
-    source "${BASH_SOURCE%/*}/init-backend"
-fi
-
-cd $tfdir
-terraform init \
-    -backend="${init_backend}" \
-    -backend-config="storage_account_name=${TF_VAR_backend_storage_account}" \
-    -backend-config="container_name=${TF_VAR_backend_storage_container}" \
-    -backend-config="key=${name}.tfstate" \
-    -backend-config="resource_group_name=${TF_VAR_backend_storage_resource_group}" \
-    -backend-config="arm_subscription_id=${TF_VAR_subscription_id}" \
-    -backend-config="arm_client_id=${TF_VAR_client_id}" \
-    -backend-config="arm_client_secret=${TF_VAR_client_secret}" \
-    -backend-config="arm_tenant_id=${TF_VAR_tenant_id}" \
-    -reconfigure
-
-export TF_VAR_installation_name=$name
 
 case $action in
     install)
         echo "Creating the Application"
-        install_or_update_app
+        install_app
         ;;
     uninstall)
-        echo "Destroying the Application"
-        terraform destroy -auto-approve
+        echo "Destroying the Application"        
+        az login --service-principal --username "${TF_VAR_client_id}" --password "${TF_VAR_client_secret}" --tenant "${TF_VAR_tenant_id}" 
+        az account set --subscription "${TF_VAR_subscription_id}" 
+        az group delete --name "${resource_group_name}" --yes
         ;;
     upgrade)
-        echo "Upgrading the Application"
-        install_or_update_app
+        echo "Upgrading the Application not yet immplemented"
         ;;
     status)
-        echo "Application Status"
-        terraform plan
+        echo "Application Status not yet implemented"
         ;;
     *)
         echo "No action for $action"
         ;;
 esac
-echo "Action $action complete for $name"
+echo "Action $action finished for $name at: $(date)"
+elapsed=$((SECONDS-started))
+echo "Duration: $((elapsed/60)) minutes $((elapsed%60)) seconds"

@@ -23,10 +23,6 @@ COPY Dockerfile /cnab/Dockerfile
 COPY app /cnab/app
 COPY app/contour /cnab/app/contour
 
-# RUN mkdir /cnab/app/contour
-# RUN curl https://raw.githubusercontent.com/heptio/contour/master/deployment/render/deployment-rbac.yaml > /cnab/app/contour/contour-deployment-rbac.yaml 
-
 RUN chmod 755 /cnab/app/run
-RUN chmod 755 /cnab/app/init-backend
 
 CMD ["/cnab/app/run"]

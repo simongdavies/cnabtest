@@ -1,11 +1,11 @@
 apiVersion: certmanager.k8s.io/v1alpha1
 kind: ClusterIssuer
 metadata:
-  name: letsencrypt-staging
+  name: ${cert_issuer}
 spec:
   acme:
-    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    server: ${cert_issuer_server}
     email: ${CNAB_P_CERT_EMAIL_ADDRESS}
     privateKeySecretRef:
-    name: letsencrypt-staging
+      name: ${cert_issuer}-key
     http01: {}

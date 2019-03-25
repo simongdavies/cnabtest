@@ -1,6 +1,6 @@
-# Terraform: A Base Invocation Image for Terraform
+# Wordpress Azure - A CNAB to deploy wordpress on Azure  
 
-This CNAB bundle provides a base image for working with TerraForm.
+This CNAB creates an installation of wordpress on Azure with optiona features such as Custom DNS , MySQL database etc..
 
 To test:
 
@@ -18,5 +18,3 @@ FROM cnab/terraform:latest
 COPY my/terraform/dir /cnab/app/tf
 # Copy your Dockerfile and bundle.json, too
 ```
-
-See the `aks-terraform` example to see how to build such an invocation image.

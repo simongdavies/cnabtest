@@ -1,0 +1,28 @@
+{
+    "issuerParameters": {
+      "certificateTransparency": null,
+      "name": "Unknown"
+    },
+    "keyProperties": {
+      "curve": null,
+      "exportable": true,
+      "keySize": 4096,
+      "keyType": "RSA",
+      "reuseKey": true
+    },
+    "secretProperties": {
+      "contentType": "application/x-pkcs12"
+    },
+    "x509CertificateProperties": {
+      "keyUsage": [
+        "cRLSign",
+        "dataEncipherment",
+        "digitalSignature",
+        "keyEncipherment",
+        "keyAgreement",
+        "keyCertSign"
+      ],
+      "subject": "${subject}",
+      "validityInMonths": 12
+    }
+  }
